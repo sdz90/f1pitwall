@@ -18,9 +18,10 @@ const http = require("http");
 const zlib = require("zlib");
 const WebSocket = require("ws");
 
-const NEGOTIATE = "https://livetiming.formula1.com/signalr/negotiate";
-const CONNECT   = "wss://livetiming.formula1.com/signalr/connect";
-const HUB = JSON.stringify([{ name: "Streaming" }]);
+const NEGOTIATE = "https://livetiming.formula1.com/signalrcore/negotiate?negotiateVersion=1";
+const WSBASE    = "wss://livetiming.formula1.com/signalrcore";
+const RS = "\x1e"; // SignalR Core record separator
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 const STATIC = "https://livetiming.formula1.com/static/";
 
 const TOPICS = [
@@ -59,53 +60,74 @@ function applyFeed(topic, data) {
   if (topic === "SessionInfo" && state.SessionInfo && state.SessionInfo.Path) sessionPath = state.SessionInfo.Path;
 }
 
-// ---- SignalR (classic ASP.NET) connection ----
+// ---- SignalR Core connection (F1's 2026 endpoint) ----
+function handleSC(m) {
+  if (m.type === 6 || m.type === 7) return;               // ping / close — ignore
+  if (m.type === 3) {                                     // Completion of our Subscribe = initial snapshot
+    if (m.result && typeof m.result === "object") {
+      const keys = Object.keys(m.result);
+      for (const topic of keys) applyFeed(topic, m.result[topic]);
+      console.log("[relay] initial snapshot: " + keys.length + " topics");
+    }
+    return;
+  }
+  if (m.type === 1 && m.target === "feed" && Array.isArray(m.arguments) && m.arguments.length >= 2) {
+    applyFeed(m.arguments[0], m.arguments[1]);             // live delta
+  }
+}
+
 async function connect() {
   try {
-    const negUrl = NEGOTIATE + "?connectionData=" + encodeURIComponent(HUB) + "&clientProtocol=1.5";
-    const neg = await fetch(negUrl, { headers: { "User-Agent": "BestHTTP" } });
+    const neg = await fetch(NEGOTIATE, { method: "POST", headers: { "User-Agent": UA, "Content-Length": "0" } });
     const cookie = (neg.headers.get("set-cookie") || "").split(";")[0];
     const rawBody = await neg.text();
     console.log("[relay] negotiate status=" + neg.status + " len=" + rawBody.length + " cookie=" + (cookie ? "yes" : "no"));
     console.log("[relay] negotiate body(first 300): " + rawBody.slice(0, 300).replace(/\s+/g, " "));
-    let body;
-    try { body = JSON.parse(rawBody); }
-    catch (e) { throw new Error("negotiate not JSON (status " + neg.status + ")"); }
-    if (!body.ConnectionToken) throw new Error("no ConnectionToken in negotiate response");
-    const token = encodeURIComponent(body.ConnectionToken);
-    const wsUrl = CONNECT + "?clientProtocol=1.5&transport=webSockets&connectionToken=" + token +
-      "&connectionData=" + encodeURIComponent(HUB);
+    let info;
+    try { info = JSON.parse(rawBody); } catch (e) { throw new Error("negotiate not JSON (status " + neg.status + ")"); }
+    const token = info.connectionToken || info.ConnectionToken;
+    if (!token) throw new Error("no connectionToken in negotiate (status " + neg.status + ")");
 
-    const sock = new WebSocket(wsUrl, {
-      headers: { "User-Agent": "BestHTTP", "Accept-Encoding": "gzip,identity", "Cookie": cookie },
-    });
+    const wsUrl = WSBASE + "?id=" + encodeURIComponent(token);
+    const sock = new WebSocket(wsUrl, { headers: { "User-Agent": UA, "Cookie": cookie, "Accept-Encoding": "gzip,identity" } });
+
+    let buf = "", handshakeDone = false, pingTimer = null;
+    const sendSC = (obj) => sock.send(JSON.stringify(obj) + RS);
 
     sock.on("open", () => {
-      connected = true;
-      console.log("[relay] connected to F1 feed, subscribing…");
-      sock.send(JSON.stringify({ H: "Streaming", M: "Subscribe", A: [TOPICS], I: 1 }));
+      console.log("[relay] ws open, handshaking…");
+      sock.send(JSON.stringify({ protocol: "json", version: 1 }) + RS);
     });
 
     sock.on("message", (raw) => {
       lastMsg = Date.now();
-      let msg; try { msg = JSON.parse(raw.toString()); } catch (_) { return; }
-      // initial full state (response to Subscribe)
-      if (msg.R && typeof msg.R === "object") {
-        for (const topic of Object.keys(msg.R)) applyFeed(topic, msg.R[topic]);
-      }
-      // incremental deltas
-      if (Array.isArray(msg.M)) {
-        for (const m of msg.M) {
-          if (m.M === "feed" && Array.isArray(m.A) && m.A.length >= 2) applyFeed(m.A[0], m.A[1]);
+      buf += raw.toString();
+      let idx;
+      while ((idx = buf.indexOf(RS)) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 1);
+        if (!chunk) continue;
+        let m; try { m = JSON.parse(chunk); } catch (_) { continue; }
+        if (!handshakeDone) {
+          if (m.error) { console.log("[relay] handshake error: " + m.error); try { sock.close(); } catch (_) {} return; }
+          handshakeDone = true; connected = true;
+          console.log("[relay] handshake ok, subscribing…");
+          sendSC({ type: 1, invocationId: "0", target: "Subscribe", arguments: [TOPICS] });
+          pingTimer = setInterval(() => { try { sock.send(JSON.stringify({ type: 6 }) + RS); } catch (_) {} }, 10000);
+          continue;
         }
+        handleSC(m);
       }
     });
 
-    sock.on("close", () => { connected = false; console.log("[relay] closed, reconnecting in 5s"); setTimeout(connect, 5000); });
-    sock.on("error", (e) => { console.log("[relay] ws error:", e.message); try { sock.close(); } catch (_) {} });
+    sock.on("close", (code) => {
+      connected = false; if (pingTimer) clearInterval(pingTimer);
+      console.log("[relay] closed (code " + code + "), reconnecting in 5s");
+      setTimeout(connect, 5000);
+    });
+    sock.on("error", (e) => { console.log("[relay] ws error: " + e.message); try { sock.close(); } catch (_) {} });
   } catch (e) {
     connected = false;
-    console.log("[relay] connect failed:", e.message, "— retrying in 10s");
+    console.log("[relay] connect failed: " + e.message + " — retrying in 10s");
     setTimeout(connect, 10000);
   }
 }
