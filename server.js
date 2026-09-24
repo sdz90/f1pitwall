@@ -65,7 +65,13 @@ async function connect() {
     const negUrl = NEGOTIATE + "?connectionData=" + encodeURIComponent(HUB) + "&clientProtocol=1.5";
     const neg = await fetch(negUrl, { headers: { "User-Agent": "BestHTTP" } });
     const cookie = (neg.headers.get("set-cookie") || "").split(";")[0];
-    const body = await neg.json();
+    const rawBody = await neg.text();
+    console.log("[relay] negotiate status=" + neg.status + " len=" + rawBody.length + " cookie=" + (cookie ? "yes" : "no"));
+    console.log("[relay] negotiate body(first 300): " + rawBody.slice(0, 300).replace(/\s+/g, " "));
+    let body;
+    try { body = JSON.parse(rawBody); }
+    catch (e) { throw new Error("negotiate not JSON (status " + neg.status + ")"); }
+    if (!body.ConnectionToken) throw new Error("no ConnectionToken in negotiate response");
     const token = encodeURIComponent(body.ConnectionToken);
     const wsUrl = CONNECT + "?clientProtocol=1.5&transport=webSockets&connectionToken=" + token +
       "&connectionData=" + encodeURIComponent(HUB);
