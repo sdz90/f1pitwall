@@ -1,0 +1,15 @@
+{
+  "name": "pitwall-relay",
+  "version": "1.0.0",
+  "description": "Relays F1's free live-timing SignalR feed as OpenF1-shaped JSON",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
