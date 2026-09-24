@@ -50,6 +50,30 @@ function inflateZ(b64) {
   catch (e) { return null; }
 }
 
+const lapHist = {};          // driver_number -> [ {lap_number, lap_duration, sectors, speeds, date_start} ]
+const lastLapVal = {};       // driver_number -> last seen LastLapTime value (to detect a completed lap)
+
+function recordLaps() {
+  const L = (state.TimingData && state.TimingData.Lines) || {};
+  for (const k of Object.keys(L)) {
+    const line = L[k];
+    const val = line.LastLapTime && line.LastLapTime.Value;
+    if (!val || val === lastLapVal[k]) continue;   // no new completed lap
+    lastLapVal[k] = val;
+    const s = line.Sectors || {};
+    const sp = line.Speeds || {};
+    const entry = {
+      lap_number: line.NumberOfLaps != null ? +line.NumberOfLaps : null,
+      lap_duration: timeToSec(val),
+      duration_sector_1: timeToSec(s[0]), duration_sector_2: timeToSec(s[1]), duration_sector_3: timeToSec(s[2]),
+      i1_speed: sp.I1 ? +sp.I1.Value : null, i2_speed: sp.I2 ? +sp.I2.Value : null, st_speed: sp.ST ? +sp.ST.Value : null,
+      date_start: new Date().toISOString(),
+    };
+    (lapHist[k] = lapHist[k] || []).push(entry);
+    if (lapHist[k].length > 120) lapHist[k].shift();
+  }
+}
+
 function applyFeed(topic, data) {
   if (topic.endsWith(".z")) {
     const plain = typeof data === "string" ? inflateZ(data) : data;
@@ -58,6 +82,7 @@ function applyFeed(topic, data) {
   }
   state[topic] = merge(state[topic], data);
   if (topic === "SessionInfo" && state.SessionInfo && state.SessionInfo.Path) sessionPath = state.SessionInfo.Path;
+  if (topic === "TimingData") recordLaps();
 }
 
 // ---- SignalR Core connection (F1's 2026 endpoint) ----
@@ -176,19 +201,12 @@ function outIntervals() {
   }));
 }
 function outLaps() {
-  const L = (state.TimingData && state.TimingData.Lines) || {};
-  return Object.keys(L).map(k => {
-    const s = L[k].Sectors || {};
-    const sp = L[k].Speeds || {};
-    return {
-      driver_number: +k,
-      lap_number: L[k].NumberOfLaps != null ? +L[k].NumberOfLaps : null,
-      lap_duration: timeToSec(L[k].LastLapTime),
-      duration_sector_1: timeToSec(s[0]), duration_sector_2: timeToSec(s[1]), duration_sector_3: timeToSec(s[2]),
-      i1_speed: sp.I1 ? +sp.I1.Value : null, i2_speed: sp.I2 ? +sp.I2.Value : null, st_speed: sp.ST ? +sp.ST.Value : null,
-      is_pit_out_lap: !!L[k].PitOut, date_start: now(),
-    };
-  });
+  // full accumulated history: every completed lap for every driver, with sectors
+  const out = [];
+  for (const k of Object.keys(lapHist)) {
+    for (const lap of lapHist[k]) out.push(Object.assign({ driver_number: +k }, lap));
+  }
+  return out;
 }
 function outStints() {
   const L = (state.TimingAppData && state.TimingAppData.Lines) || {};
@@ -264,13 +282,18 @@ function outSessions() {
   const s = state.SessionInfo;
   if (!s) return [];
   const meet = s.Meeting || {};
+  // If F1 gave an EndDate use it; otherwise, if the feed has gone quiet for >3 min,
+  // the session is effectively over — report the last-message time as the end so the
+  // app flips from LIVE to FINAL instead of hanging on "live" forever.
+  const stale = lastMsg && (Date.now() - lastMsg) > 180000;
+  const end = s.EndDate || (stale ? new Date(lastMsg).toISOString() : null);
   return [{
     session_key: "live", meeting_key: "live",
     session_name: s.Name || null, session_type: s.Type || null,
     circuit_short_name: (meet.Circuit && meet.Circuit.ShortName) || meet.Name || null,
     location: (meet.Circuit && meet.Circuit.ShortName) || null,
     country_name: (meet.Country && meet.Country.Name) || null,
-    date_start: s.StartDate || null, date_end: s.EndDate || null,
+    date_start: s.StartDate || null, date_end: end,
     gmt_offset: s.GmtOffset || null, year: s.StartDate ? +String(s.StartDate).slice(0, 4) : new Date().getFullYear(),
   }];
 }
