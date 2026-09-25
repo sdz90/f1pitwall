@@ -76,6 +76,7 @@ const TOPICS = [
   "Heartbeat", "SessionInfo", "TrackStatus", "LapCount", "DriverList",
   "TimingData", "TimingAppData", "TimingStats", "WeatherData",
   "RaceControlMessages", "Position.z", "CarData.z", "TeamRadio",
+  "ExtrapolatedClock", "SessionData",
 ];
 
 // ---- in-memory current state, merged from the feed ----
@@ -358,6 +359,23 @@ function isoWithOffset(d, gmt) {
   if (g[0] === "-") { sign = "-"; g = g.slice(1); } else if (g[0] === "+") g = g.slice(1);
   return d + sign + g.slice(0, 5);                       // e.g. "…T13:30:00" + "+04:00"
 }
+function outSessionClock() {
+  const ec = state.ExtrapolatedClock || {};
+  const L = (state.TimingData && state.TimingData.Lines) || {};
+  const knocked = Object.values(L).filter(l => l && l.KnockedOut).length;
+  const name = (state.SessionInfo && state.SessionInfo.Name) || "";
+  let part = null;
+  if (/quali/i.test(name)) part = knocked < 5 ? "Q1" : knocked < 10 ? "Q2" : "Q3";
+  return {
+    remaining: ec.Remaining || null,      // "HH:MM:SS" left in the current segment
+    utc: ec.Utc || null,                  // timestamp the Remaining was accurate at
+    extrapolating: ec.Extrapolating === true, // is the clock currently running?
+    knocked_out: knocked,
+    part,                                 // Q1 / Q2 / Q3 (qualifying only)
+    session_name: name,
+  };
+}
+
 function outSessions() {
   const s = state.SessionInfo;
   if (!s) return [];
@@ -398,6 +416,7 @@ function route(pathname, query) {
     case "/v1/pit": return []; // not cleanly available from the live feed yet
     case "/v1/track_positions": return outTrackPositions();
     case "/v1/track_outline": return { points: outline || [], source: outlineSource };
+    case "/v1/session_clock": return outSessionClock();
     default: return null;
   }
 }
@@ -420,6 +439,7 @@ const server = http.createServer((req, res) => {
       laps_recorded: Object.keys(lapHist).reduce((n, k) => n + lapHist[k].length, 0),
       outline_points: outline ? outline.length : 0, outline_source: outlineSource,
       track_positions_sample: outTrackPositions().slice(0, 3),
+      clock: outSessionClock(),
     }));
   }
   if (u.pathname === "/state") return res.end(JSON.stringify(state)); // raw, for debugging
