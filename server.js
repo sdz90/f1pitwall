@@ -292,6 +292,14 @@ function outTeamRadio() {
     recording_url: c.Path ? STATIC + sessionPath + c.Path : null,
   }));
 }
+function isoWithOffset(d, gmt) {
+  if (!d) return null;
+  if (/[zZ]$|[+-]\d\d:?\d\d$/.test(d)) return d;        // already has a timezone
+  if (!gmt) return d + "Z";                              // no offset given → treat as UTC
+  let sign = "+", g = String(gmt);
+  if (g[0] === "-") { sign = "-"; g = g.slice(1); } else if (g[0] === "+") g = g.slice(1);
+  return d + sign + g.slice(0, 5);                       // e.g. "…T13:30:00" + "+04:00"
+}
 function outSessions() {
   const s = state.SessionInfo;
   if (!s) return [];
@@ -307,7 +315,7 @@ function outSessions() {
     circuit_short_name: (meet.Circuit && meet.Circuit.ShortName) || meet.Name || null,
     location: (meet.Circuit && meet.Circuit.ShortName) || null,
     country_name: (meet.Country && meet.Country.Name) || null,
-    date_start: s.StartDate || null, date_end: end,
+    date_start: isoWithOffset(s.StartDate, s.GmtOffset), date_end: isoWithOffset(end, s.GmtOffset),
     gmt_offset: s.GmtOffset || null, year: s.StartDate ? +String(s.StartDate).slice(0, 4) : new Date().getFullYear(),
   }];
 }
