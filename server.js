@@ -63,6 +63,7 @@ function trackFraction(line) {
   return { fraction: Math.max(0, Math.min(1, done / total)), done, total };
 }
 function outTrackPositions() {
+  if (!lastMsg || (Date.now() - lastMsg) > 180000) return []; // feed quiet = session over, no live cars
   const L = (state.TimingData && state.TimingData.Lines) || {};
   const out = [];
   for (const k of Object.keys(L)) {
