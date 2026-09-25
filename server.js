@@ -23,6 +23,54 @@ const WSBASE    = "wss://livetiming.formula1.com/signalrcore";
 const RS = "\x1e"; // SignalR Core record separator
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 const STATIC = "https://livetiming.formula1.com/static/";
+const OF1_HIST = "https://api.openf1.org/v1";  // free historical data, used to build the circuit outline
+
+// ---- circuit outline (built once from OpenF1's free historical position data) ----
+let outline = null, outlineSource = "not started", outlineTried = false;
+async function buildOutline(circuit, year) {
+  try {
+    outlineSource = "building for " + circuit + "…";
+    let sess = null;
+    for (const y of [year, year - 1, year - 2]) {
+      const ss = await fetch(`${OF1_HIST}/sessions?circuit_short_name=${encodeURIComponent(circuit)}&year=${y}&session_type=Race`).then(r => r.json()).catch(() => []);
+      if (ss && ss.length) { sess = ss[ss.length - 1]; break; }
+    }
+    if (!sess) { outlineSource = "no past race session found for " + circuit; return; }
+    const laps = await fetch(`${OF1_HIST}/laps?session_key=${sess.session_key}&driver_number=1`).then(r => r.json()).catch(() => []);
+    const lap = laps.find(l => l.lap_number >= 8 && l.lap_duration && !l.is_pit_out_lap) || laps.find(l => l.lap_duration);
+    if (!lap || !lap.date_start) { outlineSource = "no clean lap in " + sess.session_key; return; }
+    const t0 = new Date(lap.date_start).toISOString();
+    const t1 = new Date(new Date(lap.date_start).getTime() + (lap.lap_duration + 2) * 1000).toISOString();
+    const loc = await fetch(`${OF1_HIST}/location?session_key=${sess.session_key}&driver_number=1&date>=${t0}&date<=${t1}`).then(r => r.json()).catch(() => []);
+    const pts = loc.filter(p => (p.x || p.y)).map(p => ({ x: p.x, y: p.y }));
+    if (pts.length > 30) { outline = pts; outlineSource = "openf1 session " + sess.session_key + " (" + pts.length + " pts)"; }
+    else outlineSource = "too few location points (" + pts.length + ")";
+  } catch (e) { outlineSource = "error: " + (e && e.message || e); }
+}
+
+// ---- mini-sector progress → fraction of the lap completed (0..1) ----
+function trackFraction(line) {
+  const sectors = line && line.Sectors;
+  if (!sectors) return null;
+  const arr = Array.isArray(sectors) ? sectors : Object.keys(sectors).sort((a, b) => +a - +b).map(k => sectors[k]);
+  let total = 0, done = 0;
+  for (const s of arr) {
+    if (!s || !s.Segments) continue;
+    const segs = Array.isArray(s.Segments) ? s.Segments : Object.keys(s.Segments).sort((a, b) => +a - +b).map(k => s.Segments[k]);
+    for (const seg of segs) { total++; if (seg && seg.Status) done++; }
+  }
+  if (!total) return null;
+  return { fraction: Math.max(0, Math.min(1, done / total)), done, total };
+}
+function outTrackPositions() {
+  const L = (state.TimingData && state.TimingData.Lines) || {};
+  const out = [];
+  for (const k of Object.keys(L)) {
+    const f = trackFraction(L[k]);
+    if (f) out.push({ driver_number: +k, fraction: f.fraction, done: f.done, total: f.total });
+  }
+  return out;
+}
 
 const TOPICS = [
   "Heartbeat", "SessionInfo", "TrackStatus", "LapCount", "DriverList",
@@ -100,7 +148,11 @@ function applyFeed(topic, data) {
     return;
   }
   state[topic] = merge(state[topic], data);
-  if (topic === "SessionInfo" && state.SessionInfo && state.SessionInfo.Path) sessionPath = state.SessionInfo.Path;
+  if (topic === "SessionInfo" && state.SessionInfo) {
+    if (state.SessionInfo.Path) sessionPath = state.SessionInfo.Path;
+    const circ = state.SessionInfo.Meeting && state.SessionInfo.Meeting.Circuit && state.SessionInfo.Meeting.Circuit.ShortName;
+    if (circ && !outlineTried) { outlineTried = true; buildOutline(circ, +String(state.SessionInfo.StartDate || "").slice(0, 4) || new Date().getFullYear()); }
+  }
   if (topic === "TimingData") recordLaps();
 }
 
@@ -344,6 +396,8 @@ function route(pathname, query) {
     case "/v1/car_data": return outCarData(dn);
     case "/v1/team_radio": return outTeamRadio();
     case "/v1/pit": return []; // not cleanly available from the live feed yet
+    case "/v1/track_positions": return outTrackPositions();
+    case "/v1/track_outline": return { points: outline || [], source: outlineSource };
     default: return null;
   }
 }
@@ -364,6 +418,8 @@ const server = http.createServer((req, res) => {
       compressed: zSeen,                                  // Position.z / CarData.z receipt + decompress status
       msgs: msgCount, bytes: bytesTotal, max_msg: maxMsg, // feed volume (heavy streams show up as big bytes)
       laps_recorded: Object.keys(lapHist).reduce((n, k) => n + lapHist[k].length, 0),
+      outline_points: outline ? outline.length : 0, outline_source: outlineSource,
+      track_positions_sample: outTrackPositions().slice(0, 3),
     }));
   }
   if (u.pathname === "/state") return res.end(JSON.stringify(state)); // raw, for debugging
