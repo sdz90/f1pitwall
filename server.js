@@ -45,9 +45,23 @@ function merge(target, delta) {
   return delta;
 }
 
-function inflateZ(b64) {
-  try { return JSON.parse(zlib.inflateRawSync(Buffer.from(b64, "base64")).toString("utf8")); }
-  catch (e) { return null; }
+const zSeen = {};   // topic -> {count, ok} to diagnose compressed streams
+function inflateZ(b64, topic) {
+  const raw = Buffer.from(b64, "base64");
+  const tries = [
+    () => zlib.inflateRawSync(raw),  // raw DEFLATE (F1's usual)
+    () => zlib.inflateSync(raw),     // zlib-wrapped
+    () => zlib.gunzipSync(raw),      // gzip, just in case
+  ];
+  for (const t of tries) {
+    try {
+      const out = JSON.parse(t().toString("utf8"));
+      if (topic) zSeen[topic] = { count: ((zSeen[topic] && zSeen[topic].count) || 0) + 1, ok: true };
+      return out;
+    } catch (_) { /* next method */ }
+  }
+  if (topic) { const p = zSeen[topic] || { count: 0 }; zSeen[topic] = { count: p.count + 1, ok: false }; }
+  return null;
 }
 
 const lapHist = {};          // driver_number -> [ {lap_number, lap_duration, sectors, speeds, date_start} ]
@@ -76,7 +90,7 @@ function recordLaps() {
 
 function applyFeed(topic, data) {
   if (topic.endsWith(".z")) {
-    const plain = typeof data === "string" ? inflateZ(data) : data;
+    const plain = typeof data === "string" ? inflateZ(data, topic) : data;
     if (plain != null) state[topic] = plain; // compressed topics arrive whole
     return;
   }
@@ -332,6 +346,8 @@ const server = http.createServer((req, res) => {
       ok: true, connected, age_ms: lastMsg ? Date.now() - lastMsg : null,
       session: (state.SessionInfo && state.SessionInfo.Name) || null,
       topics: Object.keys(state),
+      compressed: zSeen,                                  // Position.z / CarData.z receipt + decompress status
+      laps_recorded: Object.keys(lapHist).reduce((n, k) => n + lapHist[k].length, 0),
     }));
   }
   if (u.pathname === "/state") return res.end(JSON.stringify(state)); // raw, for debugging
