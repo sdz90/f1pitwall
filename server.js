@@ -33,6 +33,8 @@ const TOPICS = [
 // ---- in-memory current state, merged from the feed ----
 const state = {};            // topic -> latest merged object
 let connected = false, lastMsg = 0, sessionPath = "";
+const seenTopics = {};   // every topic name F1 actually sends us, with a count
+let bytesTotal = 0, maxMsg = 0, msgCount = 0;
 
 // deep-merge a delta into a target (F1 sends partial updates)
 function merge(target, delta) {
@@ -89,6 +91,9 @@ function recordLaps() {
 }
 
 function applyFeed(topic, data) {
+  // diagnostics: record that F1 actually sent this topic (and whether it's a string/obj)
+  if (!seenTopics[topic]) { console.log("[relay] first topic seen: " + topic + " (" + typeof data + ")"); }
+  seenTopics[topic] = (seenTopics[topic] || 0) + 1;
   if (topic.endsWith(".z")) {
     const plain = typeof data === "string" ? inflateZ(data, topic) : data;
     if (plain != null) state[topic] = plain; // compressed topics arrive whole
@@ -140,6 +145,7 @@ async function connect() {
 
     sock.on("message", (raw) => {
       lastMsg = Date.now();
+      const len = raw.length; bytesTotal += len; msgCount++; if (len > maxMsg) maxMsg = len;
       buf += raw.toString();
       let idx;
       while ((idx = buf.indexOf(RS)) >= 0) {
@@ -354,7 +360,9 @@ const server = http.createServer((req, res) => {
       ok: true, connected, age_ms: lastMsg ? Date.now() - lastMsg : null,
       session: (state.SessionInfo && state.SessionInfo.Name) || null,
       topics: Object.keys(state),
+      raw_topics: seenTopics,                             // every topic F1 actually sent, with counts
       compressed: zSeen,                                  // Position.z / CarData.z receipt + decompress status
+      msgs: msgCount, bytes: bytesTotal, max_msg: maxMsg, // feed volume (heavy streams show up as big bytes)
       laps_recorded: Object.keys(lapHist).reduce((n, k) => n + lapHist[k].length, 0),
     }));
   }
